@@ -66,7 +66,7 @@ def generate_sub_laps(lap_recs):
     return ""
 
 def get_hr_stats_precise(lap_hrs, hr_avg, hr_max):
-    """原生 Python 精確計算四分位數"""
+    """原生 Python 計算四分位數"""
     if not lap_hrs:
         val_min = hr_avg if hr_avg != '--' else '--'
         val_max = hr_max if hr_max != '--' else '--'
@@ -81,9 +81,8 @@ def get_hr_stats_precise(lap_hrs, hr_avg, hr_max):
     hr_q3 = sorted_hrs[int(n * 0.75)]
     hr_max_calc = sorted_hrs[-1]
     
-    # 確保最大心率不低於手錶摘要值
+    # 防呆：確保算出來的最大值不會低於手錶紀錄的平均與最大值
     final_max = hr_max if (hr_max != '--' and hr_max > hr_max_calc) else hr_max_calc
-    
     return hr_min, hr_q1, hr_q2, hr_q3, final_max
 
 # --- 核心解析區 ---
@@ -102,8 +101,8 @@ def parse_fit_bytes_to_text(file_bytes):
         return "找不到摘要數據。"
         
     session = session_mesgs[0]
-    activity_start = session.get('start_time')
     
+    # 預先處理結構化課表名稱對照表
     wkt_dict = {}
     for step in workout_step_mesgs:
         idx = step.get('message_index')
@@ -121,8 +120,11 @@ def parse_fit_bytes_to_text(file_bytes):
         if name and idx is not None:
             wkt_dict[idx] = name
 
+    # 1. 處理概要數據
     sport = session.get('sport', 'unknown')
-    dt = activity_start if activity_start else 'Unknown'
+    session_start_time = session.get('start_time') # 取得按下開始鍵的精確時間
+    dt = session_start_time if session_start_time else 'Unknown'
+    
     if isinstance(dt, datetime.datetime):
         date_str = dt.strftime("%Y/%m/%d %p%I:%M:%S").replace("AM", "上午").replace("PM", "下午")
     else:
@@ -152,6 +154,7 @@ def parse_fit_bytes_to_text(file_bytes):
     if file_id_mesgs:
         device = file_id_mesgs[0].get('garmin_product', device)
 
+    # 2. 處理天氣資料
     weather_str = ""
     if weather_mesgs:
         w = weather_mesgs[-1]
@@ -173,42 +176,43 @@ def parse_fit_bytes_to_text(file_bytes):
     out.append(f"額外數據: 平均 Pwr: {avg_pwr}W (最大 {max_pwr}W) | 平均 Cad: {avg_cad} | TE: {te}")
     if weather_str: out.append(weather_str.strip())
     out.append(f"裝置: {device}\n\n[分段]")
+
+    # ==========================================
+    # 核心修復：使用「漏斗分裝法」，徹底解決時間對齊斷層
+    # ==========================================
+    # 建立與分段數量相符的空籃子
+    lap_buckets = [[] for _ in range(len(lap_mesgs))]
+    current_lap_idx = 0
+    
+    for r in record_mesgs:
+        ts = r.get('timestamp')
+        if not ts: continue
+        
+        # 濾掉偷跑：如果這筆資料早於按下開始鍵的時間，直接丟棄
+        if session_start_time and ts < session_start_time:
+            continue
+            
+        # 依序把資料丟進對應的分段籃子
+        while current_lap_idx < len(lap_mesgs):
+            lap_end = lap_mesgs[current_lap_idx].get('timestamp')
+            
+            if not lap_end:
+                current_lap_idx += 1
+                continue
+                
+            if ts <= lap_end:
+                lap_buckets[current_lap_idx].append(r)
+                break  # 成功放入這個分段籃子，換下一筆資料
+            else:
+                current_lap_idx += 1  # 時間超過了，換下一個分段籃子
+    # ==========================================
     
     cumulative_dist = 0
-    record_idx = 0  
     
     for i, lap in enumerate(lap_mesgs, 1):
-        lap_end = lap.get('timestamp')
-        lap_start = lap.get('start_time')
+        # 直接從分裝好的籃子裡拿出這圈所有的逐秒紀錄
+        lap_recs = lap_buckets[i-1]
         
-        # 核心修復 1：動態填補遺失的 lap_start
-        if not lap_start:
-            if i == 1:
-                lap_start = activity_start
-            else:
-                lap_start = lap_mesgs[i-2].get('timestamp')
-                
-        lap_recs = []
-        
-        # 核心修復 2：精準攔截時間區間，忽略按錶前的廢紀錄
-        while record_idx < len(record_mesgs):
-            rec = record_mesgs[record_idx]
-            rec_ts = rec.get('timestamp')
-            
-            if not rec_ts: 
-                record_idx += 1
-                continue
-                
-            if lap_start and rec_ts < lap_start:
-                record_idx += 1 # 跳過起跑前的背景心率
-                continue
-                
-            if lap_end and rec_ts <= lap_end:
-                lap_recs.append(rec)
-                record_idx += 1
-            else:
-                break 
-                
         lap_name = lap.get('name', '')
         wkt_idx = lap.get('wkt_step_index')
         if wkt_idx is not None and wkt_idx in wkt_dict:
@@ -221,8 +225,11 @@ def parse_fit_bytes_to_text(file_bytes):
         
         hr_avg = lap.get('avg_heart_rate', '--')
         hr_max = lap.get('max_heart_rate', '--')
+        
+        # 從籃子裡抽出這圈的心率數值陣列
         lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
         
+        # 精確計算四分位數
         hr_min, hr_q1, hr_q2, hr_q3, hr_max_final = get_hr_stats_precise(lap_hrs, hr_avg, hr_max)
         
         pwr = lap.get('avg_power', '--')
@@ -266,7 +273,7 @@ uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
 
 if uploaded_file is not None:
     try:
-        with st.spinner("正在精準對齊心率時間軸..."):
+        with st.spinner("正在使用漏斗分裝法精準對齊心率時間軸..."):
             file_bytes = uploaded_file.read()
             result = parse_fit_bytes_to_text(file_bytes)
             
