@@ -50,7 +50,6 @@ def generate_sub_laps(lap, records):
     for i, r in enumerate(lap_recs):
         dist = r.get('distance')
         if dist is None: continue
-
         if r.get('heart_rate'): hrs.append(r['heart_rate'])
 
         is_last = (i == len(lap_recs) - 1)
@@ -58,7 +57,6 @@ def generate_sub_laps(lap, records):
             chunk_dist = dist - split_start_dist
             if chunk_dist > 50: 
                 dt = (r['timestamp'] - split_start_ts).total_seconds() if isinstance(split_start_ts, datetime.datetime) else (r['timestamp'] - split_start_ts)
-                
                 if dt > 0:
                     pace = m_per_s_to_pace(chunk_dist / dt)
                     avg_hr = int(sum(hrs)/len(hrs)) if hrs else '--'
@@ -73,6 +71,32 @@ def generate_sub_laps(lap, records):
     if splits:
         return " (" + ", ".join(splits) + ")"
     return ""
+
+def get_hr_stats(lap, records):
+    """計算單圈心率的統計數據 (最低與四分位數)"""
+    lap_start = lap.get('start_time')
+    lap_end = lap.get('timestamp')
+    if not lap_start or not lap_end or not records:
+        return None, None, None, None
+        
+    # 篩選該圈的逐秒心率
+    lap_hrs = [
+        r['heart_rate'] for r in records 
+        if r.get('timestamp') and r.get('heart_rate') and lap_start <= r['timestamp'] <= lap_end
+    ]
+    
+    if not lap_hrs:
+        return None, None, None, None
+        
+    sorted_hrs = sorted(lap_hrs)
+    n = len(sorted_hrs)
+    
+    hr_min = sorted_hrs[0]
+    hr_q1 = sorted_hrs[n // 4]
+    hr_q2 = sorted_hrs[n // 2] # 中位數
+    hr_q3 = sorted_hrs[(n * 3) // 4]
+    
+    return hr_min, hr_q1, hr_q2, hr_q3
 
 # --- 核心解析區 ---
 def parse_fit_bytes_to_text(file_bytes):
@@ -137,7 +161,7 @@ def parse_fit_bytes_to_text(file_bytes):
         
     # 3. 組合文字輸出
     out = []
-    out.append("[圖例] HR=平均心率/最大心率(bpm) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
+    out.append("[圖例] HR=平均(最小/Q1/Q2/Q3/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
     out.append("[概要]")
     out.append(f"運動: {sport}\n日期: {date_str}\n時間: {duration_str} | 距離: {total_dist_km:.2f}km")
     out.append(f"平均配速: {avg_pace} | 最大速度: {max_speed_kph:.1f}kph")
@@ -152,10 +176,12 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_time_str = format_time(lap.get('total_timer_time', 0))
         lap_pace = m_per_s_to_pace(lap.get('enhanced_avg_speed', 0))
         
-        hr = lap.get('avg_heart_rate', '--')
-        lap_max_hr = lap.get('max_heart_rate', '--')
-        pwr = lap.get('avg_power', '--')
+        # 獲取心率統計
+        hr_avg = lap.get('avg_heart_rate', '--')
+        hr_max = lap.get('max_heart_rate', '--')
+        hr_min, hr_q1, hr_q2, hr_q3 = get_hr_stats(lap, record_mesgs)
         
+        pwr = lap.get('avg_power', '--')
         cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
         if isinstance(cad, (int, float)): cad = int(cad * 2)
         
@@ -169,15 +195,19 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_ascent = lap.get('total_ascent', 0)
         lap_descent = lap.get('total_descent', 0)
         
-        # --- 撈取分段名稱 ---
         lap_name = lap.get('name', '')
-        # 如果有名字，就格式化為 (Warm up)，否則保持空字串
         name_str = f"({lap_name})" if lap_name else ""
         
-        # 組裝該圈的開頭，包含圈數與名稱
         parts = [f"L{i}{name_str}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
         
-        if hr != '--' or lap_max_hr != '--': parts.append(f"HR{hr}/{lap_max_hr}")
+        # 組合心率數據格式
+        if hr_avg != '--':
+            if hr_min is not None:
+                # 格式：HR156(120/140/155/165/175) -> 平均(最小/Q1/中位數/Q3/最大)
+                parts.append(f"HR{hr_avg}({hr_min}/{hr_q1}/{hr_q2}/{hr_q3}/{hr_max})")
+            else:
+                parts.append(f"HR{hr_avg}/{hr_max}")
+                
         if pwr != '--': parts.append(f"Pwr{pwr}")
         if cad != '--': parts.append(f"Cad{cad}")
         if vo != '--': parts.append(f"VO{vo}")
@@ -200,7 +230,7 @@ uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
 
 if uploaded_file is not None:
     try:
-        with st.spinner("正在讀取課表分段與數據..."):
+        with st.spinner("正在進行心率統計與四分位數計算..."):
             file_bytes = uploaded_file.read()
             result = parse_fit_bytes_to_text(file_bytes)
             
