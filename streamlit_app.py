@@ -28,17 +28,11 @@ def translate_weather_condition(cond):
     }
     return cond_map.get(cond, str(cond))
 
-def generate_sub_laps(lap, records):
+def generate_sub_laps(lap, lap_recs):
+    """根據已經分配給該圈的逐秒紀錄來切分小圈"""
     lap_dist = lap.get('total_distance', 0)
     if lap_dist <= 1005: 
         return ""
-        
-    lap_start = lap.get('start_time')
-    lap_end = lap.get('timestamp')
-    if not lap_start or not lap_end or not records:
-        return ""
-
-    lap_recs = [r for r in records if r.get('timestamp') and lap_start <= r['timestamp'] <= lap_end]
     if not lap_recs: return ""
 
     splits = []
@@ -72,19 +66,8 @@ def generate_sub_laps(lap, records):
         return " (" + ", ".join(splits) + ")"
     return ""
 
-def get_hr_stats(lap, records):
+def get_hr_stats(lap_hrs):
     """計算單圈心率的統計數據 (最低與四分位數)"""
-    lap_start = lap.get('start_time')
-    lap_end = lap.get('timestamp')
-    if not lap_start or not lap_end or not records:
-        return None, None, None, None
-        
-    # 篩選該圈的逐秒心率
-    lap_hrs = [
-        r['heart_rate'] for r in records 
-        if r.get('timestamp') and r.get('heart_rate') and lap_start <= r['timestamp'] <= lap_end
-    ]
-    
     if not lap_hrs:
         return None, None, None, None
         
@@ -93,7 +76,7 @@ def get_hr_stats(lap, records):
     
     hr_min = sorted_hrs[0]
     hr_q1 = sorted_hrs[n // 4]
-    hr_q2 = sorted_hrs[n // 2] # 中位數
+    hr_q2 = sorted_hrs[n // 2]
     hr_q3 = sorted_hrs[(n * 3) // 4]
     
     return hr_min, hr_q1, hr_q2, hr_q3
@@ -108,12 +91,34 @@ def parse_fit_bytes_to_text(file_bytes):
     lap_mesgs = messages.get('lap_mesgs', [])
     record_mesgs = messages.get('record_mesgs', []) 
     weather_mesgs = messages.get('weather_conditions_mesgs', []) 
+    workout_step_mesgs = messages.get('workout_step_mesgs', []) # 新增撈取課表設定
     
     if not session_mesgs:
         return "找不到摘要數據。"
         
     session = session_mesgs[0]
     
+    # --- 預先處理結構化課表名稱對照表 ---
+    wkt_dict = {}
+    for step in workout_step_mesgs:
+        idx = step.get('message_index')
+        name = step.get('wkt_step_name')
+        
+        # 如果使用者沒自訂名稱，則依據 Garmin 內建強度標籤翻譯
+        if not name:
+            intensity = step.get('intensity')
+            if intensity is not None:
+                int_str = str(intensity).lower()
+                if int_str in ['2', 'warmup', 'warm_up']: name = "暖身"
+                elif int_str in ['3', 'cooldown', 'cool_down']: name = "緩和"
+                elif int_str in ['1', 'rest']: name = "休息"
+                elif int_str in ['4', 'recovery']: name = "恢復"
+                elif int_str in ['0', 'active']: name = "訓練"
+                elif int_str in ['5', 'interval']: name = "間歇"
+                
+        if name and idx is not None:
+            wkt_dict[idx] = name
+
     # 1. 處理概要數據
     sport = session.get('sport', 'unknown')
     dt = session.get('start_time', 'Unknown')
@@ -161,7 +166,7 @@ def parse_fit_bytes_to_text(file_bytes):
         
     # 3. 組合文字輸出
     out = []
-    out.append("[圖例] HR=平均(最小/Q1/Q2/Q3/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
+    out.append("[圖例] HR=平均(最小/Q1/中位數/Q3/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
     out.append("[概要]")
     out.append(f"運動: {sport}\n日期: {date_str}\n時間: {duration_str} | 距離: {total_dist_km:.2f}km")
     out.append(f"平均配速: {avg_pace} | 最大速度: {max_speed_kph:.1f}kph")
@@ -171,7 +176,36 @@ def parse_fit_bytes_to_text(file_bytes):
     out.append(f"裝置: {device}\n\n[分段]")
     
     cumulative_dist = 0
+    record_idx = 0  # 用於循序掃描逐秒紀錄，解決漏抓心率問題
+    
     for i, lap in enumerate(lap_mesgs, 1):
+        # --- 精準對齊該圈的逐秒紀錄 ---
+        lap_end_time = lap.get('timestamp')
+        lap_recs = []
+        
+        while record_idx < len(record_mesgs):
+            rec = record_mesgs[record_idx]
+            rec_ts = rec.get('timestamp')
+            
+            if not rec_ts: 
+                record_idx += 1
+                continue
+                
+            if lap_end_time and rec_ts <= lap_end_time:
+                lap_recs.append(rec)
+                record_idx += 1
+            else:
+                break # 這筆紀錄超過這圈的時間了，留給下一圈
+                
+        # --- 取得課表分段名稱 ---
+        lap_name = lap.get('name', '')
+        wkt_idx = lap.get('wkt_step_index')
+        if wkt_idx is not None and wkt_idx in wkt_dict:
+            lap_name = wkt_dict[wkt_idx]
+            
+        name_str = f"({lap_name})" if lap_name else ""
+        
+        # --- 解析一般分段數據 ---
         cumulative_dist += lap.get('total_distance', 0)
         lap_time_str = format_time(lap.get('total_timer_time', 0))
         lap_pace = m_per_s_to_pace(lap.get('enhanced_avg_speed', 0))
@@ -179,7 +213,8 @@ def parse_fit_bytes_to_text(file_bytes):
         # 獲取心率統計
         hr_avg = lap.get('avg_heart_rate', '--')
         hr_max = lap.get('max_heart_rate', '--')
-        hr_min, hr_q1, hr_q2, hr_q3 = get_hr_stats(lap, record_mesgs)
+        lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
+        hr_min, hr_q1, hr_q2, hr_q3 = get_hr_stats(lap_hrs)
         
         pwr = lap.get('avg_power', '--')
         cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
@@ -195,15 +230,11 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_ascent = lap.get('total_ascent', 0)
         lap_descent = lap.get('total_descent', 0)
         
-        lap_name = lap.get('name', '')
-        name_str = f"({lap_name})" if lap_name else ""
-        
+        # --- 組裝文字 ---
         parts = [f"L{i}{name_str}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
         
-        # 組合心率數據格式
         if hr_avg != '--':
             if hr_min is not None:
-                # 格式：HR156(120/140/155/165/175) -> 平均(最小/Q1/中位數/Q3/最大)
                 parts.append(f"HR{hr_avg}({hr_min}/{hr_q1}/{hr_q2}/{hr_q3}/{hr_max})")
             else:
                 parts.append(f"HR{hr_avg}/{hr_max}")
@@ -216,7 +247,7 @@ def parse_fit_bytes_to_text(file_bytes):
         parts.append(f"Elev+{lap_ascent}/-{lap_descent}")
         
         lap_str = " | ".join(parts)
-        sub_laps_str = generate_sub_laps(lap, record_mesgs)
+        sub_laps_str = generate_sub_laps(lap, lap_recs)
         out.append(lap_str + sub_laps_str)
         
     return "\n".join(out)
