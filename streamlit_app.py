@@ -65,25 +65,20 @@ def generate_sub_laps(lap_recs):
         return " (" + ", ".join(splits) + ")"
     return ""
 
-def get_hr_stats_precise(lap_hrs, hr_avg, hr_max):
-    """原生 Python 計算四分位數"""
+def get_hr_min_max(lap_hrs, hr_avg, hr_max):
+    """簡化版：只抓最低與最高心率"""
     if not lap_hrs:
         val_min = hr_avg if hr_avg != '--' else '--'
         val_max = hr_max if hr_max != '--' else '--'
-        return val_min, hr_avg, hr_avg, hr_avg, val_max
+        return val_min, val_max
         
-    sorted_hrs = sorted(lap_hrs)
-    n = len(sorted_hrs)
+    hr_min = min(lap_hrs)
+    hr_max_calc = max(lap_hrs)
     
-    hr_min = sorted_hrs[0]
-    hr_q1 = sorted_hrs[int(n * 0.25)]
-    hr_q2 = sorted_hrs[int(n * 0.50)]
-    hr_q3 = sorted_hrs[int(n * 0.75)]
-    hr_max_calc = sorted_hrs[-1]
-    
-    # 防呆：確保算出來的最大值不會低於手錶紀錄的平均與最大值
+    # 確保最大心率不低於手錶摘要值
     final_max = hr_max if (hr_max != '--' and hr_max > hr_max_calc) else hr_max_calc
-    return hr_min, hr_q1, hr_q2, hr_q3, final_max
+    
+    return hr_min, final_max
 
 # --- 核心解析區 ---
 def parse_fit_bytes_to_text(file_bytes):
@@ -101,8 +96,8 @@ def parse_fit_bytes_to_text(file_bytes):
         return "找不到摘要數據。"
         
     session = session_mesgs[0]
+    activity_start = session.get('start_time')
     
-    # 預先處理結構化課表名稱對照表
     wkt_dict = {}
     for step in workout_step_mesgs:
         idx = step.get('message_index')
@@ -120,10 +115,8 @@ def parse_fit_bytes_to_text(file_bytes):
         if name and idx is not None:
             wkt_dict[idx] = name
 
-    # 1. 處理概要數據
     sport = session.get('sport', 'unknown')
-    session_start_time = session.get('start_time') # 取得按下開始鍵的精確時間
-    dt = session_start_time if session_start_time else 'Unknown'
+    dt = activity_start if activity_start else 'Unknown'
     
     if isinstance(dt, datetime.datetime):
         date_str = dt.strftime("%Y/%m/%d %p%I:%M:%S").replace("AM", "上午").replace("PM", "下午")
@@ -154,7 +147,6 @@ def parse_fit_bytes_to_text(file_bytes):
     if file_id_mesgs:
         device = file_id_mesgs[0].get('garmin_product', device)
 
-    # 2. 處理天氣資料
     weather_str = ""
     if weather_mesgs:
         w = weather_mesgs[-1]
@@ -168,7 +160,8 @@ def parse_fit_bytes_to_text(file_bytes):
         weather_str = f"平均氣溫: {session.get('avg_temperature')}°C (未偵測到完整天氣資料)\n"
         
     out = []
-    out.append("[圖例] HR=平均(最小/Q1/中位數/Q3/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
+    # 圖例更新：改為 HR=平均(最小/最大)
+    out.append("[圖例] HR=平均(最小/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
     out.append("[概要]")
     out.append(f"運動: {sport}\n日期: {date_str}\n時間: {duration_str} | 距離: {total_dist_km:.2f}km")
     out.append(f"平均配速: {avg_pace} | 最大速度: {max_speed_kph:.1f}kph")
@@ -177,10 +170,7 @@ def parse_fit_bytes_to_text(file_bytes):
     if weather_str: out.append(weather_str.strip())
     out.append(f"裝置: {device}\n\n[分段]")
 
-    # ==========================================
-    # 核心修復：使用「漏斗分裝法」，徹底解決時間對齊斷層
-    # ==========================================
-    # 建立與分段數量相符的空籃子
+    # 建立漏斗籃子
     lap_buckets = [[] for _ in range(len(lap_mesgs))]
     current_lap_idx = 0
     
@@ -188,29 +178,23 @@ def parse_fit_bytes_to_text(file_bytes):
         ts = r.get('timestamp')
         if not ts: continue
         
-        # 濾掉偷跑：如果這筆資料早於按下開始鍵的時間，直接丟棄
-        if session_start_time and ts < session_start_time:
+        if activity_start and ts < activity_start:
             continue
             
-        # 依序把資料丟進對應的分段籃子
         while current_lap_idx < len(lap_mesgs):
             lap_end = lap_mesgs[current_lap_idx].get('timestamp')
-            
             if not lap_end:
                 current_lap_idx += 1
                 continue
-                
             if ts <= lap_end:
                 lap_buckets[current_lap_idx].append(r)
-                break  # 成功放入這個分段籃子，換下一筆資料
+                break
             else:
-                current_lap_idx += 1  # 時間超過了，換下一個分段籃子
-    # ==========================================
+                current_lap_idx += 1
     
     cumulative_dist = 0
     
     for i, lap in enumerate(lap_mesgs, 1):
-        # 直接從分裝好的籃子裡拿出這圈所有的逐秒紀錄
         lap_recs = lap_buckets[i-1]
         
         lap_name = lap.get('name', '')
@@ -223,61 +207,4 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_time_str = format_time(lap.get('total_timer_time', 0))
         lap_pace = m_per_s_to_pace(lap.get('enhanced_avg_speed', 0))
         
-        hr_avg = lap.get('avg_heart_rate', '--')
-        hr_max = lap.get('max_heart_rate', '--')
-        
-        # 從籃子裡抽出這圈的心率數值陣列
-        lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
-        
-        # 精確計算四分位數
-        hr_min, hr_q1, hr_q2, hr_q3, hr_max_final = get_hr_stats_precise(lap_hrs, hr_avg, hr_max)
-        
-        pwr = lap.get('avg_power', '--')
-        cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
-        if isinstance(cad, (int, float)): cad = int(cad * 2)
-        
-        vo = lap.get('avg_vertical_oscillation', '--')
-        if isinstance(vo, (int, float)): vo = f"{float(vo):.1f}"
-        
-        gct = lap.get('avg_stance_time', '--')
-        if isinstance(gct, (int, float)): gct = f"{float(gct):.1f}"
-        
-        temp = lap.get('avg_temperature', '--')
-        lap_ascent = lap.get('total_ascent', 0)
-        lap_descent = lap.get('total_descent', 0)
-        
-        parts = [f"L{i}{name_str}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
-        
-        if hr_avg != '--':
-            parts.append(f"HR{hr_avg}({hr_min}/{hr_q1}/{hr_q2}/{hr_q3}/{hr_max_final})")
-                
-        if pwr != '--': parts.append(f"Pwr{pwr}")
-        if cad != '--': parts.append(f"Cad{cad}")
-        if vo != '--': parts.append(f"VO{vo}")
-        if gct != '--': parts.append(f"GCT{gct}")
-        if temp != '--': parts.append(f"Temp{temp}")
-        parts.append(f"Elev+{lap_ascent}/-{lap_descent}")
-        
-        lap_str = " | ".join(parts)
-        sub_laps_str = generate_sub_laps(lap_recs)
-        out.append(lap_str + sub_laps_str)
-        
-    return "\n".join(out)
-
-# --- 網頁介面設計 ---
-st.set_page_config(page_title="Garmin 數據解碼器", page_icon="🏃‍♂️")
-st.title("🏃‍♂️ Garmin FIT 原始數據解碼器")
-st.write("上傳您的 `.fit` 檔案，自動生成可複製的純文字分段報告。")
-
-uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
-
-if uploaded_file is not None:
-    try:
-        with st.spinner("正在使用漏斗分裝法精準對齊心率時間軸..."):
-            file_bytes = uploaded_file.read()
-            result = parse_fit_bytes_to_text(file_bytes)
-            
-        st.success("解析成功！")
-        st.text_area("請在下方全選複製您的數據：", value=result, height=500)
-    except Exception as e:
-        st.error(f"解析失敗，請確認檔案格式是否正確。錯誤訊息：{e}")
+        hr_avg = lap.get('avg_heart_rate',
