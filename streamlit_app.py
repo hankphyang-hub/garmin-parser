@@ -1,7 +1,6 @@
 import streamlit as st
 from garmin_fit_sdk import Decoder, Stream
 import datetime
-import numpy as np # 使用 numpy 計算四分位數更精準
 
 # --- 輔助函式區 ---
 def format_time(seconds):
@@ -31,8 +30,6 @@ def translate_weather_condition(cond):
 
 def generate_sub_laps(lap_recs):
     if not lap_recs: return ""
-
-    # 先算這圈總長度
     total_lap_dist = lap_recs[-1].get('distance', 0) - lap_recs[0].get('distance', 0)
     if total_lap_dist <= 1005: 
         return ""
@@ -69,19 +66,22 @@ def generate_sub_laps(lap_recs):
     return ""
 
 def get_hr_stats_precise(lap_hrs, hr_avg, hr_max):
-    """使用 Numpy 精確計算四分位數"""
+    """原生 Python 精確計算四分位數"""
     if not lap_hrs:
         val_min = hr_avg if hr_avg != '--' else '--'
         val_max = hr_max if hr_max != '--' else '--'
         return val_min, hr_avg, hr_avg, hr_avg, val_max
         
-    hr_min = int(np.min(lap_hrs))
-    hr_q1 = int(np.percentile(lap_hrs, 25))
-    hr_q2 = int(np.median(lap_hrs))
-    hr_q3 = int(np.percentile(lap_hrs, 75))
-    hr_max_calc = int(np.max(lap_hrs))
+    sorted_hrs = sorted(lap_hrs)
+    n = len(sorted_hrs)
     
-    # 防呆機制：確保最大心率不會小於手錶自己算的
+    hr_min = sorted_hrs[0]
+    hr_q1 = sorted_hrs[int(n * 0.25)]
+    hr_q2 = sorted_hrs[int(n * 0.50)]
+    hr_q3 = sorted_hrs[int(n * 0.75)]
+    hr_max_calc = sorted_hrs[-1]
+    
+    # 確保最大心率不低於手錶摘要值
     final_max = hr_max if (hr_max != '--' and hr_max > hr_max_calc) else hr_max_calc
     
     return hr_min, hr_q1, hr_q2, hr_q3, final_max
@@ -102,6 +102,7 @@ def parse_fit_bytes_to_text(file_bytes):
         return "找不到摘要數據。"
         
     session = session_mesgs[0]
+    activity_start = session.get('start_time')
     
     wkt_dict = {}
     for step in workout_step_mesgs:
@@ -121,7 +122,7 @@ def parse_fit_bytes_to_text(file_bytes):
             wkt_dict[idx] = name
 
     sport = session.get('sport', 'unknown')
-    dt = session.get('start_time', 'Unknown')
+    dt = activity_start if activity_start else 'Unknown'
     if isinstance(dt, datetime.datetime):
         date_str = dt.strftime("%Y/%m/%d %p%I:%M:%S").replace("AM", "上午").replace("PM", "下午")
     else:
@@ -174,17 +175,40 @@ def parse_fit_bytes_to_text(file_bytes):
     out.append(f"裝置: {device}\n\n[分段]")
     
     cumulative_dist = 0
+    record_idx = 0  
     
     for i, lap in enumerate(lap_mesgs, 1):
-        # 核心修正：使用明確的 start_time 和 timestamp(end_time) 來篩選這圈的資料
-        lap_start = lap.get('start_time')
         lap_end = lap.get('timestamp')
+        lap_start = lap.get('start_time')
         
+        # 核心修復 1：動態填補遺失的 lap_start
+        if not lap_start:
+            if i == 1:
+                lap_start = activity_start
+            else:
+                lap_start = lap_mesgs[i-2].get('timestamp')
+                
         lap_recs = []
-        if lap_start and lap_end:
-            # 完整搜查所有 record，只取時間介於這圈起訖時間的資料
-            lap_recs = [r for r in record_mesgs if r.get('timestamp') and lap_start <= r.get('timestamp') <= lap_end]
+        
+        # 核心修復 2：精準攔截時間區間，忽略按錶前的廢紀錄
+        while record_idx < len(record_mesgs):
+            rec = record_mesgs[record_idx]
+            rec_ts = rec.get('timestamp')
             
+            if not rec_ts: 
+                record_idx += 1
+                continue
+                
+            if lap_start and rec_ts < lap_start:
+                record_idx += 1 # 跳過起跑前的背景心率
+                continue
+                
+            if lap_end and rec_ts <= lap_end:
+                lap_recs.append(rec)
+                record_idx += 1
+            else:
+                break 
+                
         lap_name = lap.get('name', '')
         wkt_idx = lap.get('wkt_step_index')
         if wkt_idx is not None and wkt_idx in wkt_dict:
@@ -199,7 +223,6 @@ def parse_fit_bytes_to_text(file_bytes):
         hr_max = lap.get('max_heart_rate', '--')
         lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
         
-        # 改用更精準的 numpy 計算
         hr_min, hr_q1, hr_q2, hr_q3, hr_max_final = get_hr_stats_precise(lap_hrs, hr_avg, hr_max)
         
         pwr = lap.get('avg_power', '--')
@@ -243,7 +266,7 @@ uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
 
 if uploaded_file is not None:
     try:
-        with st.spinner("正在進行心率統計與四分位數計算..."):
+        with st.spinner("正在精準對齊心率時間軸..."):
             file_bytes = uploaded_file.read()
             result = parse_fit_bytes_to_text(file_bytes)
             
