@@ -1,6 +1,7 @@
 import streamlit as st
 from garmin_fit_sdk import Decoder, Stream
 import datetime
+import numpy as np # 使用 numpy 計算四分位數更精準
 
 # --- 輔助函式區 ---
 def format_time(seconds):
@@ -28,12 +29,13 @@ def translate_weather_condition(cond):
     }
     return cond_map.get(cond, str(cond))
 
-def generate_sub_laps(lap, lap_recs):
-    """根據已經分配給該圈的逐秒紀錄來切分小圈"""
-    lap_dist = lap.get('total_distance', 0)
-    if lap_dist <= 1005: 
-        return ""
+def generate_sub_laps(lap_recs):
     if not lap_recs: return ""
+
+    # 先算這圈總長度
+    total_lap_dist = lap_recs[-1].get('distance', 0) - lap_recs[0].get('distance', 0)
+    if total_lap_dist <= 1005: 
+        return ""
 
     splits = []
     split_start_ts = lap_recs[0]['timestamp']
@@ -66,20 +68,23 @@ def generate_sub_laps(lap, lap_recs):
         return " (" + ", ".join(splits) + ")"
     return ""
 
-def get_hr_stats(lap_hrs):
-    """計算單圈心率的統計數據 (最低與四分位數)"""
+def get_hr_stats_precise(lap_hrs, hr_avg, hr_max):
+    """使用 Numpy 精確計算四分位數"""
     if not lap_hrs:
-        return None, None, None, None
+        val_min = hr_avg if hr_avg != '--' else '--'
+        val_max = hr_max if hr_max != '--' else '--'
+        return val_min, hr_avg, hr_avg, hr_avg, val_max
         
-    sorted_hrs = sorted(lap_hrs)
-    n = len(sorted_hrs)
+    hr_min = int(np.min(lap_hrs))
+    hr_q1 = int(np.percentile(lap_hrs, 25))
+    hr_q2 = int(np.median(lap_hrs))
+    hr_q3 = int(np.percentile(lap_hrs, 75))
+    hr_max_calc = int(np.max(lap_hrs))
     
-    hr_min = sorted_hrs[0]
-    hr_q1 = sorted_hrs[n // 4]
-    hr_q2 = sorted_hrs[n // 2]
-    hr_q3 = sorted_hrs[(n * 3) // 4]
+    # 防呆機制：確保最大心率不會小於手錶自己算的
+    final_max = hr_max if (hr_max != '--' and hr_max > hr_max_calc) else hr_max_calc
     
-    return hr_min, hr_q1, hr_q2, hr_q3
+    return hr_min, hr_q1, hr_q2, hr_q3, final_max
 
 # --- 核心解析區 ---
 def parse_fit_bytes_to_text(file_bytes):
@@ -91,20 +96,17 @@ def parse_fit_bytes_to_text(file_bytes):
     lap_mesgs = messages.get('lap_mesgs', [])
     record_mesgs = messages.get('record_mesgs', []) 
     weather_mesgs = messages.get('weather_conditions_mesgs', []) 
-    workout_step_mesgs = messages.get('workout_step_mesgs', []) # 新增撈取課表設定
+    workout_step_mesgs = messages.get('workout_step_mesgs', [])
     
     if not session_mesgs:
         return "找不到摘要數據。"
         
     session = session_mesgs[0]
     
-    # --- 預先處理結構化課表名稱對照表 ---
     wkt_dict = {}
     for step in workout_step_mesgs:
         idx = step.get('message_index')
         name = step.get('wkt_step_name')
-        
-        # 如果使用者沒自訂名稱，則依據 Garmin 內建強度標籤翻譯
         if not name:
             intensity = step.get('intensity')
             if intensity is not None:
@@ -115,11 +117,9 @@ def parse_fit_bytes_to_text(file_bytes):
                 elif int_str in ['4', 'recovery']: name = "恢復"
                 elif int_str in ['0', 'active']: name = "訓練"
                 elif int_str in ['5', 'interval']: name = "間歇"
-                
         if name and idx is not None:
             wkt_dict[idx] = name
 
-    # 1. 處理概要數據
     sport = session.get('sport', 'unknown')
     dt = session.get('start_time', 'Unknown')
     if isinstance(dt, datetime.datetime):
@@ -151,7 +151,6 @@ def parse_fit_bytes_to_text(file_bytes):
     if file_id_mesgs:
         device = file_id_mesgs[0].get('garmin_product', device)
 
-    # 2. 處理天氣資料
     weather_str = ""
     if weather_mesgs:
         w = weather_mesgs[-1]
@@ -164,7 +163,6 @@ def parse_fit_bytes_to_text(file_bytes):
     elif session.get('avg_temperature'):
         weather_str = f"平均氣溫: {session.get('avg_temperature')}°C (未偵測到完整天氣資料)\n"
         
-    # 3. 組合文字輸出
     out = []
     out.append("[圖例] HR=平均(最小/Q1/中位數/Q3/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
     out.append("[概要]")
@@ -176,45 +174,33 @@ def parse_fit_bytes_to_text(file_bytes):
     out.append(f"裝置: {device}\n\n[分段]")
     
     cumulative_dist = 0
-    record_idx = 0  # 用於循序掃描逐秒紀錄，解決漏抓心率問題
     
     for i, lap in enumerate(lap_mesgs, 1):
-        # --- 精準對齊該圈的逐秒紀錄 ---
-        lap_end_time = lap.get('timestamp')
-        lap_recs = []
+        # 核心修正：使用明確的 start_time 和 timestamp(end_time) 來篩選這圈的資料
+        lap_start = lap.get('start_time')
+        lap_end = lap.get('timestamp')
         
-        while record_idx < len(record_mesgs):
-            rec = record_mesgs[record_idx]
-            rec_ts = rec.get('timestamp')
+        lap_recs = []
+        if lap_start and lap_end:
+            # 完整搜查所有 record，只取時間介於這圈起訖時間的資料
+            lap_recs = [r for r in record_mesgs if r.get('timestamp') and lap_start <= r.get('timestamp') <= lap_end]
             
-            if not rec_ts: 
-                record_idx += 1
-                continue
-                
-            if lap_end_time and rec_ts <= lap_end_time:
-                lap_recs.append(rec)
-                record_idx += 1
-            else:
-                break # 這筆紀錄超過這圈的時間了，留給下一圈
-                
-        # --- 取得課表分段名稱 ---
         lap_name = lap.get('name', '')
         wkt_idx = lap.get('wkt_step_index')
         if wkt_idx is not None and wkt_idx in wkt_dict:
             lap_name = wkt_dict[wkt_idx]
-            
         name_str = f"({lap_name})" if lap_name else ""
         
-        # --- 解析一般分段數據 ---
         cumulative_dist += lap.get('total_distance', 0)
         lap_time_str = format_time(lap.get('total_timer_time', 0))
         lap_pace = m_per_s_to_pace(lap.get('enhanced_avg_speed', 0))
         
-        # 獲取心率統計
         hr_avg = lap.get('avg_heart_rate', '--')
         hr_max = lap.get('max_heart_rate', '--')
         lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
-        hr_min, hr_q1, hr_q2, hr_q3 = get_hr_stats(lap_hrs)
+        
+        # 改用更精準的 numpy 計算
+        hr_min, hr_q1, hr_q2, hr_q3, hr_max_final = get_hr_stats_precise(lap_hrs, hr_avg, hr_max)
         
         pwr = lap.get('avg_power', '--')
         cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
@@ -230,14 +216,10 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_ascent = lap.get('total_ascent', 0)
         lap_descent = lap.get('total_descent', 0)
         
-        # --- 組裝文字 ---
         parts = [f"L{i}{name_str}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
         
         if hr_avg != '--':
-            if hr_min is not None:
-                parts.append(f"HR{hr_avg}({hr_min}/{hr_q1}/{hr_q2}/{hr_q3}/{hr_max})")
-            else:
-                parts.append(f"HR{hr_avg}/{hr_max}")
+            parts.append(f"HR{hr_avg}({hr_min}/{hr_q1}/{hr_q2}/{hr_q3}/{hr_max_final})")
                 
         if pwr != '--': parts.append(f"Pwr{pwr}")
         if cad != '--': parts.append(f"Cad{cad}")
@@ -247,7 +229,7 @@ def parse_fit_bytes_to_text(file_bytes):
         parts.append(f"Elev+{lap_ascent}/-{lap_descent}")
         
         lap_str = " | ".join(parts)
-        sub_laps_str = generate_sub_laps(lap, lap_recs)
+        sub_laps_str = generate_sub_laps(lap_recs)
         out.append(lap_str + sub_laps_str)
         
     return "\n".join(out)
