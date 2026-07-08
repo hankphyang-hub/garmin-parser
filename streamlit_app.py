@@ -20,14 +20,6 @@ def m_per_s_to_pace(m_per_s):
     s = int(sec_per_km % 60)
     return f"{m}:{s:02d}/km"
 
-def translate_weather_condition(cond):
-    if isinstance(cond, str): return cond.capitalize()
-    cond_map = {
-        0: '晴朗', 1: '多雲時晴', 2: '多雲', 3: '雨', 4: '雪', 5: '有風', 
-        6: '雷雨', 7: '雨夾雪', 8: '霧', 11: '小雨', 12: '大雨', 20: '陰天'
-    }
-    return cond_map.get(cond, str(cond))
-
 def generate_sub_laps(lap_recs):
     """用於長距離分段（大於1km）自動拆分每一公里小圈"""
     if not lap_recs: return ""
@@ -66,6 +58,19 @@ def generate_sub_laps(lap_recs):
         return " (" + ", ".join(splits) + ")"
     return ""
 
+def get_hr_min_max(lap_hrs, hr_avg, hr_max):
+    """簡化版：只抓最低與最高心率"""
+    if not lap_hrs:
+        val_min = hr_avg if hr_avg != '--' else '--'
+        val_max = hr_max if hr_max != '--' else '--'
+        return val_min, val_max
+        
+    hr_min = min(lap_hrs)
+    hr_max_calc = max(lap_hrs)
+    
+    final_max = hr_max if (hr_max != '--' and hr_max > hr_max_calc) else hr_max_calc
+    return hr_min, final_max
+
 # --- 核心解析區 ---
 def parse_fit_bytes_to_text(file_bytes):
     stream = Stream.from_byte_array(bytearray(file_bytes))
@@ -75,7 +80,6 @@ def parse_fit_bytes_to_text(file_bytes):
     session_mesgs = messages.get('session_mesgs', [])
     lap_mesgs = messages.get('lap_mesgs', [])
     record_mesgs = messages.get('record_mesgs', []) 
-    weather_mesgs = messages.get('weather_conditions_mesgs', []) 
     workout_step_mesgs = messages.get('workout_step_mesgs', [])
     
     if not session_mesgs:
@@ -102,12 +106,13 @@ def parse_fit_bytes_to_text(file_bytes):
         if name and idx is not None:
             wkt_dict[idx] = name
 
-    # 1. 處理概要數據
     sport = session.get('sport', 'unknown')
     dt = activity_start if activity_start else 'Unknown'
     
+    # 【時區修正】在這裡將 UTC 時間加上 8 小時轉換為台灣時間
     if isinstance(dt, datetime.datetime):
-        date_str = dt.strftime("%Y/%m/%d %p%I:%M:%S").replace("AM", "上午").replace("PM", "下午")
+        dt_taiwan = dt + datetime.timedelta(hours=8)
+        date_str = dt_taiwan.strftime("%Y/%m/%d %p%I:%M:%S").replace("AM", "上午").replace("PM", "下午")
     else:
         date_str = str(dt)
         
@@ -134,30 +139,24 @@ def parse_fit_bytes_to_text(file_bytes):
     file_id_mesgs = messages.get('file_id_mesgs', [])
     if file_id_mesgs:
         device = file_id_mesgs[0].get('garmin_product', device)
-
-    weather_str = ""
-    if weather_mesgs:
-        w = weather_mesgs[-1]
-        cond = translate_weather_condition(w.get('condition', '未知'))
-        temp = w.get('temperature', '--')
-        feels = w.get('feels_like_temperature', '--')
-        wind_ms = w.get('wind_speed', 0)
-        wind_kph = round(wind_ms * 3.6, 1) if wind_ms else '--'
-        weather_str = f"天氣狀況: {cond} | 氣溫: {temp}°C (體感 {feels}°C) | 風速: {wind_kph} km/h\n"
-    elif session.get('avg_temperature'):
-        weather_str = f"平均氣溫: {session.get('avg_temperature')}°C (未偵測到完整天氣資料)\n"
         
     out = []
-    out.append("[圖例] HR=平均/最大心率(bpm) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
+    # 圖例重新補上 Temp(溫度)
+    out.append("[圖例] HR=平均(最小/最大) Pwr=功率(W) Cad=步頻(spm) VO=垂直振幅(mm) GCT=觸地時間(ms) Temp=溫度(°C) Elev=海拔變化(m)\n")
     out.append("[概要]")
     out.append(f"運動: {sport}\n日期: {date_str}\n時間: {duration_str} | 距離: {total_dist_km:.2f}km")
     out.append(f"平均配速: {avg_pace} | 最大速度: {max_speed_kph:.1f}kph")
     out.append(f"HR: 平均 {avg_hr} / 最大 {max_hr}\n海拔: +{ascent}m / -{descent}m\n卡路里: {calories}")
     out.append(f"額外數據: 平均 Pwr: {avg_pwr}W (最大 {max_pwr}W) | 平均 Cad: {avg_cad} | TE: {te}")
-    if weather_str: out.append(weather_str.strip())
+    
+    # 概要區補上單純的手錶內建「平均氣溫」
+    avg_temp = session.get('avg_temperature')
+    if avg_temp is not None:
+        out.append(f"平均氣溫: {avg_temp}°C")
+        
     out.append(f"裝置: {device}\n\n[分段]")
 
-    # 漏斗分裝法（保留給自動切分1km小圈使用）
+    # 漏斗分裝法
     lap_buckets = [[] for _ in range(len(lap_mesgs))]
     current_lap_idx = 0
     
@@ -182,7 +181,6 @@ def parse_fit_bytes_to_text(file_bytes):
     for i, lap in enumerate(lap_mesgs, 1):
         lap_recs = lap_buckets[i-1]
         
-        # 獲取課表名稱
         lap_name = lap.get('name', '')
         wkt_idx = lap.get('wkt_step_index')
         if wkt_idx is not None and wkt_idx in wkt_dict:
@@ -193,9 +191,10 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_time_str = format_time(lap.get('total_timer_time', 0))
         lap_pace = m_per_s_to_pace(lap.get('enhanced_avg_speed', 0))
         
-        # 直接抓取官方摘要數據，避免任何語法或空值錯誤
         hr_avg = lap.get('avg_heart_rate', '--')
         hr_max = lap.get('max_heart_rate', '--')
+        lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
+        hr_min, hr_max_final = get_hr_min_max(lap_hrs, hr_avg, hr_max)
         
         pwr = lap.get('avg_power', '--')
         cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
@@ -207,21 +206,21 @@ def parse_fit_bytes_to_text(file_bytes):
         gct = lap.get('avg_stance_time', '--')
         if isinstance(gct, (int, float)): gct = f"{float(gct):.1f}"
         
+        # 分段數據重新補上手錶記錄的單圈平均溫度
         temp = lap.get('avg_temperature', '--')
         lap_ascent = lap.get('total_ascent', 0)
         lap_descent = lap.get('total_descent', 0)
         
         parts = [f"L{i}{name_str}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
         
-        # 乾淨俐落的 HR平均/最大 格式
-        if hr_avg != '--' or hr_max != '--':
-            parts.append(f"HR{hr_avg}/{hr_max}")
+        if hr_avg != '--':
+            parts.append(f"HR{hr_avg}({hr_min}/{hr_max_final})")
                 
         if pwr != '--': parts.append(f"Pwr{pwr}")
         if cad != '--': parts.append(f"Cad{cad}")
         if vo != '--': parts.append(f"VO{vo}")
         if gct != '--': parts.append(f"GCT{gct}")
-        if temp != '--': parts.append(f"Temp{temp}")
+        if temp != '--': parts.append(f"Temp{temp}") # 補回分段溫度
         parts.append(f"Elev+{lap_ascent}/-{lap_descent}")
         
         lap_str = " | ".join(parts)
@@ -239,7 +238,7 @@ uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
 
 if uploaded_file is not None:
     try:
-        with st.spinner("正在解析心率與分段數據..."):
+        with st.spinner("正在解析您的跑步數據..."):
             file_bytes = uploaded_file.read()
             result = parse_fit_bytes_to_text(file_bytes)
             
