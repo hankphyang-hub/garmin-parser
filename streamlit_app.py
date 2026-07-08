@@ -207,4 +207,61 @@ def parse_fit_bytes_to_text(file_bytes):
         lap_time_str = format_time(lap.get('total_timer_time', 0))
         lap_pace = m_per_s_to_pace(lap.get('enhanced_avg_speed', 0))
         
-        hr_avg = lap.get('avg_heart_rate',
+        hr_avg = lap.get('avg_heart_rate', '--')
+        hr_max = lap.get('max_heart_rate', '--')
+        
+        lap_hrs = [r['heart_rate'] for r in lap_recs if r.get('heart_rate')]
+        
+        # 改呼叫簡化版的函式
+        hr_min, hr_max_final = get_hr_min_max(lap_hrs, hr_avg, hr_max)
+        
+        pwr = lap.get('avg_power', '--')
+        cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
+        if isinstance(cad, (int, float)): cad = int(cad * 2)
+        
+        vo = lap.get('avg_vertical_oscillation', '--')
+        if isinstance(vo, (int, float)): vo = f"{float(vo):.1f}"
+        
+        gct = lap.get('avg_stance_time', '--')
+        if isinstance(gct, (int, float)): gct = f"{float(gct):.1f}"
+        
+        temp = lap.get('avg_temperature', '--')
+        lap_ascent = lap.get('total_ascent', 0)
+        lap_descent = lap.get('total_descent', 0)
+        
+        parts = [f"L{i}{name_str}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
+        
+        # 心率輸出格式簡化為： HR156(140/168)
+        if hr_avg != '--':
+            parts.append(f"HR{hr_avg}({hr_min}/{hr_max_final})")
+                
+        if pwr != '--': parts.append(f"Pwr{pwr}")
+        if cad != '--': parts.append(f"Cad{cad}")
+        if vo != '--': parts.append(f"VO{vo}")
+        if gct != '--': parts.append(f"GCT{gct}")
+        if temp != '--': parts.append(f"Temp{temp}")
+        parts.append(f"Elev+{lap_ascent}/-{lap_descent}")
+        
+        lap_str = " | ".join(parts)
+        sub_laps_str = generate_sub_laps(lap_recs)
+        out.append(lap_str + sub_laps_str)
+        
+    return "\n".join(out)
+
+# --- 網頁介面設計 ---
+st.set_page_config(page_title="Garmin 數據解碼器", page_icon="🏃‍♂️")
+st.title("🏃‍♂️ Garmin FIT 原始數據解碼器")
+st.write("上傳您的 `.fit` 檔案，自動生成可複製的純文字分段報告。")
+
+uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
+
+if uploaded_file is not None:
+    try:
+        with st.spinner("正在解析心率極值與分段數據..."):
+            file_bytes = uploaded_file.read()
+            result = parse_fit_bytes_to_text(file_bytes)
+            
+        st.success("解析成功！")
+        st.text_area("請在下方全選複製您的數據：", value=result, height=500)
+    except Exception as e:
+        st.error(f"解析失敗，請確認檔案格式是否正確。錯誤訊息：{e}")
