@@ -18,7 +18,6 @@ def m_per_s_to_pace(m_per_s):
     return f"{m}:{s:02d}/km"
 
 def parse_fit_bytes_to_text(file_bytes):
-    # 這裡改成直接從記憶體(Bytes)讀取上傳的檔案，而不是從硬碟路徑讀取
     stream = Stream.from_byte_array(bytearray(file_bytes))
     decoder = Decoder(stream)
     messages, errors = decoder.read()
@@ -51,8 +50,14 @@ def parse_fit_bytes_to_text(file_bytes):
     calories = session.get('total_calories', '--')
     avg_pwr = session.get('avg_power', '--')
     max_pwr = session.get('max_power', '--')
+    
+    # 概要的步頻 (乘以 2 轉為雙腳 spm)
     avg_cad = session.get('avg_running_cadence', session.get('avg_cadence', '--'))
+    if isinstance(avg_cad, (int, float)): avg_cad = int(avg_cad * 2)
+
+    # TE 訓練效果 (保留 1 位小數，例如 3.2)
     te = session.get('total_training_effect', '--')
+    if isinstance(te, (int, float)): te = f"{float(te):.1f}"
     
     device = "Unknown Garmin Device"
     file_id_mesgs = messages.get('file_id_mesgs', [])
@@ -60,13 +65,13 @@ def parse_fit_bytes_to_text(file_bytes):
         device = file_id_mesgs[0].get('garmin_product', device)
         
     out = []
-    out.append("[图例] HR=心率(bpm) Pwr=功率(W) Cad=踏频(rpm/spm) GCT=触地时间(ms) VO=垂直振幅(mm) Elev=海拔(m)\n")
+    out.append("[圖例] HR=心率(bpm) Pwr=功率(W) Cad=步頻(spm) GCT=觸地時間(ms) VO=垂直振幅(mm) Elev=海拔(m)\n")
     out.append("[概要]")
-    out.append(f"运动: {sport}\n日期: {date_str}\n用时: {duration_str} | 距离: {total_dist_km:.2f}km")
+    out.append(f"運動: {sport}\n日期: {date_str}\n時間: {duration_str} | 距離: {total_dist_km:.2f}km")
     out.append(f"平均配速: {avg_pace} | 最大速度: {max_speed_kph:.1f}kph")
     out.append(f"HR: 平均 {avg_hr} / 最大 {max_hr}\n海拔: +{ascent}m / -{descent}m\n卡路里: {calories}")
-    out.append(f"额外数据: 平均 Pwr: {avg_pwr}W (最大 {max_pwr}W) | 平均 Cad: {avg_cad} | TE: {te}")
-    out.append(f"设备: {device}\n\n[分段]")
+    out.append(f"額外數據: 平均 Pwr: {avg_pwr}W (最大 {max_pwr}W) | 平均 Cad: {avg_cad} | TE: {te}")
+    out.append(f"裝置: {device}\n\n[分段]")
     
     cumulative_dist = 0
     for i, lap in enumerate(lap_mesgs, 1):
@@ -76,13 +81,18 @@ def parse_fit_bytes_to_text(file_bytes):
         
         hr = lap.get('avg_heart_rate', '--')
         pwr = lap.get('avg_power', '--')
+        
+        # 分段步頻 (乘以 2 轉為雙腳 spm)
         cad = lap.get('avg_running_cadence', lap.get('avg_cadence', '--'))
+        if isinstance(cad, (int, float)): cad = int(cad * 2)
         
+        # 經濟性指標：VO 垂直振幅 (不除以 10，強制保留 1 位小數)
         vo = lap.get('avg_vertical_oscillation', '--')
-        if isinstance(vo, (int, float)): vo = round(vo / 10)
+        if isinstance(vo, (int, float)): vo = f"{float(vo):.1f}"
         
+        # 經濟性指標：GCT 觸地時間 (不除以 10，強制保留 1 位小數)
         gct = lap.get('avg_stance_time', '--')
-        if isinstance(gct, (int, float)): gct = round(gct / 10)
+        if isinstance(gct, (int, float)): gct = f"{float(gct):.1f}"
         
         parts = [f"L{i}: {cumulative_dist/1000:.2f}km", lap_time_str, lap_pace]
         if hr != '--': parts.append(f"HR{hr}")
@@ -98,7 +108,7 @@ def parse_fit_bytes_to_text(file_bytes):
 # --- 網頁介面設計 ---
 st.set_page_config(page_title="Garmin 數據解碼器", page_icon="🏃‍♂️")
 st.title("🏃‍♂️ Garmin FIT 原始數據解碼器")
-st.write("上傳你的 `.fit` 檔案，自動生成可複製的純文字分段報告。")
+st.write("上傳您的 `.fit` 檔案，自動生成可複製的純文字分段報告。")
 
 uploaded_file = st.file_uploader("請選擇 FIT 檔案", type=["fit"])
 
@@ -110,6 +120,6 @@ if uploaded_file is not None:
             
         st.success("解析成功！")
         # 用 text_area 顯示，讓使用者點擊就能直接全選複製
-        st.text_area("請在下方全選複製你的數據：", value=result, height=450)
+        st.text_area("請在下方全選複製您的數據：", value=result, height=450)
     except Exception as e:
         st.error(f"解析失敗，請確認檔案格式是否正確。錯誤訊息：{e}")
